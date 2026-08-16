@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keda-demo-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keda-demo-consumer
+  template:
+    metadata:
+      labels:
+        app: keda-demo-consumer
+    spec:
+      containers:
+        - name: consumer
+          image: keda-demo-consumer:local
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: PUB_SUB_PROJECT
+              value: "local-test-project"
+            - name: PUB_SUB_SUBSCRIPTION
+              value: "keda-demo-topic-subscription"
+            - name: PUBSUB_EMULATOR_HOST
+              value: "pubsub-emulator:8085"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
