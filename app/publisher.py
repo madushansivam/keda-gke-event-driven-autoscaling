@@ -16,8 +16,13 @@ def get_config():
         "topic_name": os.environ["TOPIC_NAME"],
     }
 
+def build_message_payload(message_id):
+    """Pure function: builds the message bytes for a given ID. Testable without GCP."""
+    return f"event-{message_id}".encode("utf-8")
+
+
 def publish_message(publisher, topic_path, message_id):
-    data = f"event-{message_id}".encode("utf-8")
+    data = build_message_payload(message_id)
     future = publisher.publish(topic_path, data)
     return future.result()  # blocks until ack from Pub/Sub, raises on failure
 
