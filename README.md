@@ -1,48 +1,79 @@
 # KEDA GKE Event-Driven Autoscaling
 
-> Kubernetes workloads that scale from **zero to N and back to zero**, driven entirely by GCP Pub/Sub queue depth — not CPU/memory.
+> Kubernetes workloads that scale from **zero to N and back to zero**, driven by event backlog — not CPU/memory alone.
 
-Most Kubernetes autoscaling (HPA) reacts to CPU and memory. That's a poor proxy for workloads like queue consumers, where a pod can sit at 2% CPU while a backlog of 10,000 unprocessed messages builds up. This project uses [KEDA](https://keda.sh) to scale a Kubernetes Deployment directly off Pub/Sub subscription backlog — including scaling to **zero replicas** when there's no work, which HPA cannot do on its own.
+Most Kubernetes autoscaling (HPA) reacts to CPU and memory. That's a poor proxy for workloads like queue consumers, where a pod can sit at low CPU while a backlog of thousands of unprocessed messages builds up. This project uses [KEDA](https://keda.sh) to scale a Kubernetes Deployment off external event signals, including scaling to **zero replicas** when there's no work — something native HPA cannot do on its own.
 
 ---
 
-## Architecture
+## Current Status
+
+This project is built and verified against a **local Kubernetes cluster** (`kind`) with a **GCP Pub/Sub emulator**, rather than live GKE and real Pub/Sub. That's a deliberate, temporary choice, not an oversight — see [Why Local, Not Live GKE](#why-local-not-live-gke) below.
+
+| Component | Status |
+|---|---|
+| Publisher / Consumer app (Python) | ✅ Built, tested, working |
+| Docker image (multi-stage, non-root) | ✅ Built and verified |
+| Local Kubernetes cluster (`kind`) + KEDA | ✅ Installed and verified |
+| Autoscaling proven end-to-end | ✅ Demonstrated (0→5→1 replica cycle recorded — see demo below) |
+| GCP Pub/Sub (real, live) | ⏸️ Written and ready; not yet run against live GCP |
+| Google Kubernetes Engine (real, live) | ⏸️ Manifests ready; not yet deployed |
+| GitHub Actions CI (test + build) | ✅ Live and passing on every push |
+
+---
+
+## Demo
+
+![Scaling demo](docs/demo.gif)
+
+*(0 → 5 replicas as load increases, back to 1 as it clears — recorded against the local cluster below.)*
+
+---
+
+## Architecture (Local Setup)
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  publisher.py                                                     │
 │  Simulates event traffic: steady / burst / ramp load patterns     │
-└───────────────────────────┬────────────────────────────────────── ┘
+└───────────────────────────┬──────────────────────────────────────┘
                              │ publishes
-┌────────────────────────────▼───────────────────────────────────────┐
-│  GCP Pub/Sub                                                       │
+┌────────────────────────────▼──────────────────────────────────────┐
+│  GCP Pub/Sub Emulator (in-cluster pod)                             │
 │  Topic: keda-demo-topic → Subscription: keda-demo-topic-subscription│
-└────────────────────────────┬───────────────────────────────────────┘
-                             │ polled every 5s
-┌────────────────────────────▼───────────────────────────────────────┐
-│  KEDA (installed via Helm)                                         │
-│  ScaledObject watches subscription backlog                        │
-│  minReplicas: 0 → maxReplicas: 10                                  │
-└────────────────────────────┬───────────────────────────────────────┘
+└────────────────────────────┬──────────────────────────────────────┘
+                             │ polled
+┌────────────────────────────▼──────────────────────────────────────┐
+│  KEDA (installed via Helm, in-cluster)                              │
+│  ScaledObject watches backlog / CPU metric                         │
+│  minReplicas: 0-1 → maxReplicas: 5-10                              │
+└────────────────────────────┬──────────────────────────────────────┘
                              │ scales
-┌────────────────────────────▼───────────────────────────────────────┐
-│  GKE Autopilot                                                     │
+┌────────────────────────────▼──────────────────────────────────────┐
+│  kind (Kubernetes-in-Docker)                                       │
 │  Deployment: keda-demo-consumer                                    │
 │  consumer.py — pulls messages, simulates variable work, acks       │
-│  Auth: GCP Workload Identity (no static keys)                     │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+The same manifests (`k8s/deployment.yaml`, `k8s/keda-scaledobject.yaml`) are written for real GKE + Workload Identity + live Pub/Sub, and require no code changes to deploy there — see [`docs/DEPLOY.md`](docs/DEPLOY.md).
+
 ---
 
-## Why This Exists
+## Why Local, Not Live GKE
 
-This started as a rebuild of a public KEDA/GKE reference repo that used a now-deprecated GCP auth pattern (`podIdentity`) and a synthetic load generator that just published the same string in a `while true` loop. The rebuild:
+Real GKE and Pub/Sub require a linked GCP billing account. I attempted to activate GCP's free trial, but the required one-time verification charge was declined by my bank and the trial account never activated — a real, unresolved friction point common for cards issued outside a handful of countries GCP fully supports for this flow.
 
-- Replaces deprecated auth with **GCP Workload Identity**
-- Replaces the flat load loop with **three realistic traffic patterns** (steady, burst, ramp) so scaling behavior is actually visible and demoable
-- Adds a **consumer that simulates variable processing time**, instead of an instant ack, so the autoscaling curve reflects real workload behavior
-- Adds **tests, CI, and CD** — none of which existed in the original reference implementation
+Rather than block the whole project on that, I rebuilt the entire stack locally:
+- **`kind`** (Kubernetes-in-Docker) in place of GKE
+- **GCP's own official Pub/Sub emulator** in place of live Pub/Sub — same client library, same API surface, running as a pod in the cluster
+- **KEDA**, installed and configured identically to how it would run on GKE
+
+This let me build, test, and prove the entire autoscaling mechanism — including a real scale-up/scale-down cycle driven by Kubernetes' HPA and KEDA, verified live — at zero cost. The moment real GCP billing is available, `docs/DEPLOY.md` walks through deploying the exact same manifests to live GKE with no code changes required.
+
+**One known gap:** KEDA's native `gcp-pubsub` scaler type requires real Google Application Credentials and cannot be pointed at the emulator, even with the emulator host configured — this is a hard requirement in KEDA's scaler implementation, not a configuration issue on my end. So the local demo above uses a **CPU-based ScaledObject** to prove the scaling mechanism (KEDA watching a metric, driving Kubernetes' HPA, scaling the Deployment up and down), while the actual Pub/Sub-triggered `ScaledObject` YAML is written, reviewed against KEDA's current documentation, and ready for live GCP.
+
+I also discovered, while researching this, that KEDA has deprecated the `gcp-pubsub` scaler type in favor of a Prometheus-based approach (GCP is deprecating the underlying query language the old scaler depends on). `k8s/keda-scaledobject.yaml` already reflects the updated, current approach.
 
 ---
 
@@ -50,9 +81,9 @@ This started as a rebuild of a public KEDA/GKE reference repo that used a now-de
 
 ### Prerequisites
 
-- Python ≥ 3.10
+- Python ≥ 3.10 (project pinned to 3.12 — see `.python-version`)
 - Docker
-- (Optional, for full local K8s testing) `kind` or `minikube` + `kubectl` + `helm`
+- `kind`, `kubectl`, `helm` (for full local cluster testing)
 
 ### 1. Clone and install
 
@@ -67,56 +98,31 @@ pip install -r app/requirements-dev.txt
 ### 2. Run unit tests (no GCP credentials required)
 
 ```bash
-python -m pytest app/tests/ -v
+python -m pytest app/tests/test_consumer.py -v
 ```
 
-### 3. Run against the Pub/Sub emulator (no live GCP project needed)
+### 3. Run against the Pub/Sub emulator
 
 ```bash
-docker run -d -p 8085:8085 google/cloud-sdk:emulators \
+docker run -d -p 8085:8085 gcr.io/google.com/cloudsdktool/cloud-sdk:emulators \
   gcloud beta emulators pubsub start --host-port=0.0.0.0:8085
 export PUBSUB_EMULATOR_HOST=localhost:8085
 python -m pytest app/tests/test_publisher_integration.py -v
 ```
 
----
-
-## Full Deploy (GKE + KEDA)
-
-Full step-by-step setup — including GCP project creation, Workload Identity, GKE Autopilot, KEDA install via Helm, and the ScaledObject — is documented in [`docs/DEPLOY.md`](docs/DEPLOY.md).
-
-Once deployed, trigger a scaling demo:
+### 4. Full local Kubernetes + KEDA demo
 
 ```bash
-# Terminal 1: watch pods scale live
-kubectl get pods -w
-
-# Terminal 2: generate a burst of load
-export GCP_PROJECT_ID=<your-project-id>
-export TOPIC_NAME=keda-demo-topic
-python app/publisher.py --mode burst
+kind create cluster --name keda-demo
+helm repo add kedacore https://kedacore.github.io/charts
+helm install keda kedacore/keda --namespace keda --create-namespace
+kind load docker-image keda-demo-consumer:local --name keda-demo
+kubectl apply -f k8s/local/pubsub-emulator.yaml
+kubectl apply -f k8s/local/consumer-deployment.yaml
+kubectl apply -f k8s/local/keda-scaledobject-cpu-demo.yaml
 ```
 
-Pods scale from 0 → up to 10 as the queue fills, then back to 0 after the configured cooldown period with no backlog.
-
-![Scaling demo](docs/demo.gif)
-
----
-
-## What This Does and Doesn't Demonstrate
-
-**What it reliably demonstrates:**
-- Event-driven (not resource-driven) autoscaling on Kubernetes
-- Scale-to-zero, which native HPA cannot do
-- Secure, keyless GCP authentication from GKE via Workload Identity
-- A working CI/CD pipeline in both GitHub Actions and Jenkins, testing and deploying the same codebase
-
-**What it does not attempt to demonstrate:**
-- Production-scale message throughput or load testing at volume
-- Multi-region or multi-cluster failover
-- Cost optimization beyond scale-to-zero (no FinOps tooling)
-
-This is a learning and portfolio project — a clean, correct reference implementation, not a production system.
+Then watch it scale — full walkthrough in [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ---
 
@@ -125,15 +131,13 @@ This is a learning and portfolio project — a clean, correct reference implemen
 | Layer | Tool |
 |---|---|
 | Language | Python 3.12 |
-| Messaging | GCP Pub/Sub |
-| Autoscaling | KEDA 2.x (Helm) |
-| Orchestration | Google Kubernetes Engine (Autopilot) |
-| Auth | GCP Workload Identity Federation |
+| Messaging | GCP Pub/Sub (emulator locally; live GCP-ready) |
+| Autoscaling | KEDA 2.20 (Helm) |
+| Local orchestration | `kind` (Kubernetes-in-Docker) |
+| Target orchestration | Google Kubernetes Engine (manifests ready) |
 | Containerization | Docker (multi-stage, non-root) |
 | Testing | pytest, pytest-cov, Pub/Sub emulator |
-| CI | GitHub Actions |
-| CI (secondary) | Jenkins |
-| CD | GitHub Actions → GKE (`kubectl set image`) |
+| CI | GitHub Actions (test + build, live and passing) |
 
 ---
 
@@ -150,16 +154,20 @@ keda-gke-event-driven-autoscaling/
 │       ├── test_consumer.py
 │       └── test_publisher_integration.py
 ├── k8s/
-│   ├── service-account.yaml  # Workload Identity-bound KSA
-│   ├── deployment.yaml       # Consumer Deployment with resource limits
-│   └── keda-scaledobject.yaml
+│   ├── service-account.yaml       # Workload Identity-bound KSA (real GKE)
+│   ├── deployment.yaml            # Consumer Deployment with resource limits (real GKE)
+│   ├── keda-scaledobject.yaml     # Prometheus-based Pub/Sub scaler (real GKE)
+│   └── local/
+│       ├── pubsub-emulator.yaml
+│       ├── consumer-deployment.yaml
+│       └── keda-scaledobject-cpu-demo.yaml
 ├── .github/workflows/
-│   └── ci.yml                # test → build → deploy
-├── Jenkinsfile
-├── Dockerfile                # Multi-stage, non-root
+│   └── ci.yml                 # test → build, live and passing
+├── Dockerfile                 # Multi-stage, non-root
+├── .python-version             # Pinned to 3.12
 └── docs/
-    ├── DEPLOY.md              # Full GCP + GKE + KEDA setup
-    └── gcp-setup.md
+    ├── DEPLOY.md               # Full GCP + GKE + KEDA setup (for when billing is available)
+    └── demo.gif
 ```
 
 ---
@@ -167,10 +175,11 @@ keda-gke-event-driven-autoscaling/
 ## What I Learned
 
 - Why HPA's resource-based model breaks down for queue-consumer workloads, and how KEDA closes that gap using external metrics adapters
-- GCP Workload Identity Federation as the modern replacement for both service account keys and the older node-level Pod Identity pattern
-- How to design a load generator with distinct traffic shapes (steady/burst/ramp) instead of a flat loop, to make scaling behavior demoable and testable
-- Structuring a Python service to be testable independent of live cloud credentials, using the Pub/Sub emulator for integration tests
-- Running the same pipeline through two different CI tools (GitHub Actions, Jenkins) to understand the tradeoffs of hosted vs. self-managed CI
+- How to build and validate an entire event-driven autoscaling pipeline locally, at zero cost, when cloud billing isn't an option — and to treat that as a legitimate engineering path, not a compromise
+- That `kind` clusters need `metrics-server` installed manually (unlike GKE, which ships it by default) before HPA/KEDA can read CPU metrics
+- KEDA's `gcp-pubsub` scaler unconditionally requires real Google Application Credentials, and cannot run against the Pub/Sub emulator even with the emulator host configured
+- That KEDA has deprecated `gcp-pubsub` in favor of a Prometheus-based scaler, and how to migrate a ScaledObject to the current recommended approach
+- Diagnosing real infrastructure failure modes: a stray `GITHUB_TOKEN` environment variable silently overriding git auth, a `protobuf`/Python 3.14 incompatibility, and Pub/Sub emulator state loss on pod restart (in-memory only, no persistence)
 
 ---
 
